@@ -8,7 +8,7 @@
  * Pump 12vDC 90ml/min D8 - PB0 > opto/mosfet 
  * LCD 16x2 by I2C
  * PUSH BOTTON for LCD contro  16x2 by I2C   D4  //INT1 
- * Wakeup slave by falling edge from PC1 -> to PC3(INT1) before SPI
+ * Wakeup slave by falling edge from PD7 -> to PC3(INT1) before SPI
  
  */
 
@@ -20,24 +20,29 @@
 #include <Wire.h>
 #include "rgb_lcd.h"
 #include "DHT.h"
+#include <ArduinoJson.h>
+
 
 // === Pin Definitions ===
 #define DHTPIN      2
 #define DHTTYPE     DHT11
 #define SOIL_PIN    0        // ADC0 == A0
 #define BUTTON_PIN  4        // button
-#define FAN_PIN     PB1      // Fan control
-
+#define FAN_PIN     PB0      // Fan control
+#define PUMP_PIN    PD6      // Pump control
 #define WAKEUP_PIN  PD7      // Slave wakeup
 
+#define LOG_ENABLE  1        // Log Flag
+#define DEBUG_ENABLE  0      // Debug Flag
+
+
 // SPI commands
-// SPI commands
-#define CMD_LED_ON			      0x10	//Lamp ON
-#define CMD_LED_OFF			      0x11	//Lamp OFF
+#define CMD_LED_ON			      0x10	// Lamp ON
+#define CMD_LED_OFF			      0x11	// Lamp OFF
 #define CMD_DOOR_OPEN		      0x20	// activate servo to OPEN vent
 #define CMD_DOOR_CLOSE		    0x21	// activate servo to CLOSE vent
 #define CMD_GET_DOOR_STATE	  0x30	// checking vent State: open/closed?
-#define CMD_GET_STATE		      0x40	//here sould be a lot of data. (servo, door, LED, light) probably it not fit in 4 byte + 2 byte timestamp + (massage counter?/Checksum?/parity?)
+#define CMD_GET_STATE		      0x40	// 
 #define CMD_GET_SENSOR		    0x41	// Light sensor level
 #define CMD_DUMMY			        0xFF	// empty byte to read response
 
@@ -54,13 +59,14 @@ typedef struct {
     uint8_t light_level;
 	  uint8_t	led_status;
     uint8_t door_status;      // 0=Open, 1=Closed, 2=Moving, 3=Error
+    uint8_t checksum;
     float   temp_level;
     float   hum_level;
     uint8_t soil_level;
     bool    fan_status;
     bool    pump_status;
     bool    lcd_status;
-    uint8_t checksum;
+    
 } SensorData;
 
 volatile SensorData sensor_data = {0};
@@ -158,14 +164,14 @@ void SPI_MasterInit(void) {
   PORTB |= (1 << SS_PIN);
   
   SPCR = (1 << SPE)|(1 << MSTR)| (1 << SPR0) | (1 << CPHA);
-  Serial.println(F("SPI_MasterInit "));
+  DebugSerial(F("LOG:INTO:SPI_MasterInit "));
 }
 
 uint8_t SPI_MasterTransmit(uint8_t data) {
   SPDR = data;                        
   // Start transmission
   while(!(SPSR & (1<<SPIF)));       
-  //Serial.println(F("SPI_MasterTransmit done "));
+  DebugSerial(F("LOG:INTO:SPI_MasterTransmit done "));
   return SPDR;                        
   // Wait for transfer complete
   // Return received byte
@@ -177,14 +183,14 @@ void sendCommand(uint8_t cmd) {
   _delay_ms(2);        // Time to wakeup 
   PORTD |= (1 << WAKEUP_PIN);   // Slave can go power down
   _delay_ms(2);
-  PORTB &= ~(1 << SS_PIN);      // SS LOW (выбрать слейва)
-  SPI_MasterTransmit(cmd);      // Отправляем команду
+  PORTB &= ~(1 << SS_PIN);      // SS LOW (Slave select)
+  SPI_MasterTransmit(cmd);      // Send command
   _delay_ms(SEND_DELAY); 
   uint8_t end_marker = SPI_MasterTransmit(CMD_DUMMY);
-  PORTB |= (1 << SS_PIN);       // SS HIGH (завершить сеанс)
+  PORTB |= (1 << SS_PIN);       // SS HIGH (End Session)
   
   if (end_marker != 0x4F) {
-    Serial.println("Protocol Error: Confirmation missing.");
+    Serial.print("LOG:ERROR:Protocol Error: Confirmation missing. CMD: ");
     Serial.println(cmd);
   }
   SPI_ready = true;
@@ -193,54 +199,66 @@ void sendCommand(uint8_t cmd) {
 uint8_t readData(uint8_t cmd) {
   SPI_ready = false;
   if (cmd == CMD_GET_STATE) {
-    //Serial.println("CMD_GET_STATE start");
-    uint8_t response;
-    uint8_t timelowb, timehighb , responcheck;
-    PORTD &= ~(1 << WAKEUP_PIN);  // Wakeup slave from power down
-    _delay_ms(2);        // Time to wakeup 
-    PORTD |= (1 << WAKEUP_PIN);   // Slave can go power down
-    _delay_ms(2); 
-    PORTB &= ~(1 << SS_PIN);      // Start
-    SPI_MasterTransmit(cmd);      // 1. Send cmd
-    _delay_ms(SEND_DELAY);           
-    timehighb = SPI_MasterTransmit(CMD_DUMMY); //Timestamp Highbyte
-    _delay_ms(SEND_DELAY); 
-    timelowb = SPI_MasterTransmit(CMD_DUMMY);  //Timestamp lowbyte
-    sensor_data.timestamp_ms = (timehighb << 8) | timelowb;
-    _delay_ms(SEND_DELAY); 
-    sensor_data.light_level = SPI_MasterTransmit(CMD_DUMMY); // LiGHT
+    DebugSerial(F("LOG:INTO:CMD_GET_STATE start"));
 
-    _delay_ms(SEND_DELAY); 
-    sensor_data.door_status = SPI_MasterTransmit(CMD_DUMMY); //DOOR
-    _delay_ms(SEND_DELAY); 
-    sensor_data.led_status = SPI_MasterTransmit(CMD_DUMMY);  //LED
+    uint8_t packet[7]; // [0..6] = timestampH, timestampL, light, door, led, checksum, end_marker
+
+    // Wakeup slave
+    PORTD &= ~(1 << WAKEUP_PIN);
+    _delay_ms(2);
+    PORTD |= (1 << WAKEUP_PIN);
+    _delay_ms(2);
+
+    // Start session
+    PORTB &= ~(1 << SS_PIN);
+    SPI_MasterTransmit(cmd);      // Send command
     _delay_ms(SEND_DELAY);
-    responcheck = SPI_MasterTransmit(CMD_DUMMY);  // CHKSUM
-    _delay_ms(SEND_DELAY);
-    uint8_t end_marker = SPI_MasterTransmit(CMD_DUMMY); // End Marker read 
-    uint8_t locCheckSum = calculate_checksum((SensorData*)&sensor_data);
-    if (responcheck != locCheckSum ) {
-      Serial.print(responcheck);              //recieved checkSum  
-      Serial.print(" Checksum error! ");
-      Serial.println(locCheckSum);            //local calc
-      
+
+    // Read the entire packet into an array
+    for (uint8_t i = 0; i < 7; i++) {
+        packet[i] = SPI_MasterTransmit(CMD_DUMMY);
+        _delay_ms(SEND_DELAY);
     }
-    if (end_marker != 0xAA) {
-      Serial.println("Protocol Error: End Marker missing.");
+
+    // Filling out the structure
+    sensor_data.timestamp_ms = (packet[0] << 8) | packet[1];
+    sensor_data.light_level  = packet[2];
+    sensor_data.door_status  = packet[3];
+    sensor_data.led_status   = packet[4];
+    sensor_data.checksum     = packet[5];
+
+    // check Checksum
+    uint8_t calcSum = 0;
+    for (uint8_t i = 0; i < 5; i++) { // count [0..4]
+        calcSum ^= packet[i];
     }
-    PORTB |= (1 << SS_PIN);       // Stop
-    PORTD |= (1 << WAKEUP_PIN);   // Slave can go power down
+
+    if (sensor_data.checksum != calcSum) {
+        Serial.print("LOG:ERROR: Checksum error! Recieved: ");
+        Serial.print(sensor_data.checksum);
+        Serial.print(" local: ");
+        Serial.println(calcSum);
+    }
+
+    // Marker check
+    if (packet[6] != 0xAA) {
+        LogSerial(F("LOG:ERROR:Protocol Error: End Marker missing."));
+    }
+
+    // Stop session
+    PORTB |= (1 << SS_PIN);
+    PORTD |= (1 << WAKEUP_PIN);
     SPI_ready = true;
     return 1;
   } else {
   SPI_ready = false;
   uint8_t response;
   PORTD &= ~(1 << WAKEUP_PIN);  // Wakeup slave from power down
-  _delay_ms(4);        // Time to wakeup 
+  _delay_ms(4);                 // Time to wakeup 
   PORTB &= ~(1 << SS_PIN);      // Start
-  SPI_MasterTransmit(cmd);      // 1. Send cmd
+  SPI_MasterTransmit(cmd);      //  Send cmd
   _delay_ms(SEND_DELAY);           
-  response = SPI_MasterTransmit(CMD_DUMMY); // 2. Шлем пустышку, чтобы выкачать ответ
+  response = SPI_MasterTransmit(CMD_DUMMY); // send dummy to get real reply
   PORTB |= (1 << SS_PIN);       // Stop
   PORTD |= (1 << WAKEUP_PIN);   // Slave can go power down
   SPI_ready = true;
@@ -326,11 +344,11 @@ void soilLevel() {
   // === Read Soil Moisture ===
   float emaAlpha = 0.2;
   uint16_t soilADC = adc_read(SOIL_PIN);
-  const int SOIL_DRY_ADC = 650; // adjusted with calibration
-  const int SOIL_WET_ADC = 850; // adjusted with calibration
+  const int SOIL_DRY_ADC = 10; // adjusted with calibration
+  const int SOIL_WET_ADC = 890; // adjusted with calibration
   if (soilADC < 5) {
-    Serial.println(F("Senor out of SOIL! "));
-    return;
+    DebugSerial(F("LOG:WARNING:Senor out of SOIL! "));
+    sensor_data.pump_status = false;
   }
   int soilPercent = map(soilADC, SOIL_DRY_ADC, SOIL_WET_ADC, 0, 100);
 
@@ -340,9 +358,14 @@ void soilLevel() {
 
 void stateMachine(void) {
   
-  Serial.println(sensor_data.soil_level);
+  DebugSerial(sensor_data.soil_level);
   // === Fan Control ===
-  sensor_data.fan_status = (sensor_data.soil_level > 80);
+  
+  if ((sensor_data.soil_level > 90) || (sensor_data.temp_level > 28) || (sensor_data.hum_level > 90)) {
+    sensor_data.fan_status=true;
+  } else if ((sensor_data.soil_level < 80) && (sensor_data.temp_level < 26) && (sensor_data.hum_level < 80)) {
+    sensor_data.fan_status=false;
+  }
   if (sensor_data.fan_status)  {
     sendCommand(CMD_DOOR_OPEN);     //Open vent door
     _delay_ms(200);                  // waiting for servo
@@ -359,9 +382,13 @@ void stateMachine(void) {
   else                           sendCommand(CMD_LED_OFF);
 
   // === Pump Control ===
-  sensor_data.pump_status = (sensor_data.soil_level < 25);
-  if (sensor_data.pump_status)   PORTB |= (1 << PB0);
-  else                           PORTB &= ~(1 << PB0);
+  if (sensor_data.soil_level < 30 && sensor_data.soil_level >= 1) {
+    sensor_data.pump_status = true;
+  } else if (sensor_data.soil_level > 55 || sensor_data.soil_level < 1 ) {
+    sensor_data.pump_status = false;
+  }
+  if (sensor_data.pump_status)   PORTD |= (1 << PUMP_PIN);
+  else                           PORTD &= ~(1 << PUMP_PIN);
 }
 
 
@@ -370,7 +397,7 @@ void setup() {
   Wire.begin();
   lcd.begin(16, 2);
   lcd.setRGB(255, 255, 0);
-  lcd.print("Hello World!");
+  lcd.print("Smart Greenhouse");
 
   //wakeup pin init
   DDRD  |= (1 << WAKEUP_PIN); // pin init
@@ -380,6 +407,10 @@ void setup() {
   // Fan pin init
   DDRB |= (1 << FAN_PIN);   // fan output D9 = PB1
   PORTB &= ~(1 << FAN_PIN); // Fan OFF initially
+
+  // Pump pin init
+  DDRD |= (1 << PUMP_PIN);   // Pump output D9 = PB1
+  PORTD &= ~(1 << PUMP_PIN); // Pump OFF initially
 
   // Button init
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -394,8 +425,8 @@ void setup() {
 
   // Serial Monitor
   Serial.begin(9600);
-  Serial.println(F("Smart Greenhouse CPS Node"));
-
+  LogSerial(F("LOG:INTO:Smart Greenhouse CPS Node Loading"));
+  
   //SPI Master mode init
   //SPI_MasterInit();
 
@@ -420,38 +451,46 @@ void loop() {
   // === LCD Display ===
   LCDdata();
 
-  // === Serial Monitor Output ===
+  // === Json Output for Node Red===
+  sendJsonData();
 
-  bool dhtOK = !(isnan(sensor_data.temp_level) || isnan(sensor_data.hum_level));
-
-  Serial.print(F("ADC="));
-  Serial.print(soilADC);
-  Serial.print(F(" | Soil="));
-  Serial.print(sensor_data.soil_level);
-  Serial.print(F("% | "));
-  if (dhtOK) {
-    Serial.print(F("Temp="));
-    Serial.print(sensor_data.temp_level, 1);
-    Serial.print(F("C | Hum="));
-    Serial.print(sensor_data.hum_level, 1);
-    Serial.print(F("% | "));
-  } else {
-    Serial.print(F("DHT ERROR | "));
-  }
-  Serial.print(F("Fan="));
-  Serial.print(sensor_data.fan_status ? F("ON | ") : F("OFF | "));
-  Serial.print("Light: ");
-  Serial.print(sensor_data.light_level);
-  Serial.print(" lx | ");
-  Serial.print("LED lamp: ");
-  Serial.print(sensor_data.led_status ? "ON | " : "OFF | ");
-  Serial.print("Vent: ");
-  Serial.print(sensor_data.door_status ? "CLOSE  | " : "OPEN | ");
-  Serial.print(F("Page="));
-  Serial.println(page);
+  
 
   measurement_ready = true;
   
  // if (measurement_ready && SPI_ready == 1)   go_to_sleep();
 
+}
+
+void sendJsonData() {
+  // 1. Create JSON-doc
+  const size_t CAPACITY = JSON_OBJECT_SIZE(8); // 8 fields
+  StaticJsonDocument<CAPACITY> doc;
+  
+  // 2. data pack
+  doc["soilHum"] = sensor_data.soil_level;
+  doc["temp"] = sensor_data.temp_level;
+  doc["hum"] = sensor_data.hum_level;
+  doc["light"] = sensor_data.light_level;
+  doc["fan"] = sensor_data.fan_status; // true/false
+  doc["vent"] = !sensor_data.door_status; 
+  doc["pump"] = sensor_data.pump_status;
+  doc["led"] = sensor_data.led_status; // true/false
+  
+  // 3. serializeJson() send JSON as one string
+  Serial.print(F("DATA:"));
+  serializeJson(doc, Serial); 
+  
+  // 4. new line Node-RED!
+  Serial.println(); 
+}
+
+void LogSerial(__FlashStringHelper* text) {
+  if (LOG_ENABLE) Serial.println(text);
+  return;
+}
+
+void DebugSerial(__FlashStringHelper* text) {
+  if (DEBUG_ENABLE) Serial.println(text);
+  return;
 }
